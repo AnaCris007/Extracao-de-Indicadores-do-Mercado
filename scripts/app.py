@@ -24,14 +24,14 @@ from premissas_macro import (
 )
 
 st.set_page_config(page_title="Premissas Macro", page_icon="📊", layout="wide")
-st.title("Premissas macro para valuation")
+st.title("Premissas Macro para Valuation")
 st.caption("IPCA, Selic, PIB, Ouro e Prata — fontes oficiais: IBGE, Banco Central e Yahoo Finance")
 
 with st.form("filtros"):
     indicadores = st.multiselect("Indicadores", TODOS_INDICADORES, default=TODOS_INDICADORES)
 
     col1, col2 = st.columns(2)
-    ano_inicio = col1.number_input("Ano inicial (histórico)", min_value=2010, max_value=date.today().year, value=ANO_INICIO_PADRAO)
+    ano_inicio = col1.number_input("Ano inicial (histórico)", min_value=2018, max_value=date.today().year, value=ANO_INICIO_PADRAO)
     ano_fim = col2.number_input("Ano final (projeção)", min_value=date.today().year, max_value=date.today().year + 10, value=ANO_FIM_PADRAO)
 
     gerar = st.form_submit_button("Gerar planilha", type="primary")

@@ -30,7 +30,7 @@ Uso:
     python scripts/premissas_macro.py
 """
 
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import quote
 
 import pandas as pd
@@ -107,6 +107,44 @@ def get_pib_historico() -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def get_sgs_serie(codigo: int, ano_inicio: int) -> pd.DataFrame:
+    """Busca uma série diária do SGS/BCB (colunas Data/Valor), quebrando a
+    consulta em janelas de até 10 anos.
+
+    A própria API do Banco Central recusa (HTTP 406) qualquer consulta de
+    série diária com janela maior que 10 anos - então pedir, por exemplo,
+    2015 a 2030 numa chamada só falha. Aqui isso é escondido do resto do
+    código: quem chama só pensa em "ano inicial", sem se preocupar com o
+    limite.
+    """
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados"
+    inicio = date(ano_inicio, 1, 1)
+    partes = []
+    while inicio <= HOJE:
+        fim_janela = min(inicio + timedelta(days=3650), HOJE)  # ~9 anos e 11 meses, sempre < 10 anos
+        params = {"formato": "json", "dataInicial": inicio.strftime("%d/%m/%Y"), "dataFinal": fim_janela.strftime("%d/%m/%Y")}
+
+        payload = None
+        for tentativa in range(2):  # a API do BCB às vezes falha/demora de forma transitória
+            try:
+                payload = requests.get(url, params=params, timeout=30).json()
+                break
+            except (requests.RequestException, ValueError):
+                if tentativa == 1:
+                    print(f"aviso: falha ao buscar série {codigo} de {inicio} a {fim_janela}, pulando janela")
+
+        if isinstance(payload, list) and payload:
+            partes.append(pd.DataFrame(payload))
+        inicio = fim_janela + timedelta(days=1)
+
+    if not partes:
+        return pd.DataFrame(columns=["Data", "Valor"])
+    df = pd.concat(partes, ignore_index=True)
+    df["Data"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
+    df["Valor"] = df["valor"].astype(float)
+    return df[["Data", "Valor"]].sort_values("Data").reset_index(drop=True)
+
+
 def get_selic_historico(ano_inicio: int) -> pd.DataFrame:
     """Selic (meta Copom) realizada, 1 linha por ano já fechado - BCB, SGS série 432.
 
@@ -116,12 +154,7 @@ def get_selic_historico(ano_inicio: int) -> pd.DataFrame:
     entram aqui: o ano corrente em diante já vem do Focus (get_focus), que
     é projeção por definição, ainda não fechou.
     """
-    url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados"
-    params = {"formato": "json", "dataInicial": date(ano_inicio, 1, 1).strftime("%d/%m/%Y"), "dataFinal": HOJE.strftime("%d/%m/%Y")}
-    payload = requests.get(url, params=params, timeout=30).json()
-    df = pd.DataFrame(payload)
-    df["Data"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
-    df["Valor"] = df["valor"].astype(float)
+    df = get_sgs_serie(432, ano_inicio)
     df = df[df["Data"].dt.year < HOJE.year]
 
     ultimo_por_ano = df.sort_values("Data").groupby(df["Data"].dt.year).last()
@@ -187,11 +220,8 @@ def get_focus(indicador: str, nome: str, unidade: str, anos: list[int]) -> pd.Da
 
 def get_usd_brl(ano_inicio: int) -> pd.DataFrame:
     """Câmbio USD/BRL (PTAX venda) - Banco Central, série SGS 1."""
-    url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados"
-    params = {"formato": "json", "dataInicial": date(ano_inicio, 1, 1).strftime("%d/%m/%Y"), "dataFinal": HOJE.strftime("%d/%m/%Y")}
-    payload = requests.get(url, params=params, timeout=30).json()
-    df = pd.DataFrame(payload)
-    return pd.DataFrame({"Data": pd.to_datetime(df["data"], format="%d/%m/%Y"), "USDBRL": df["valor"].astype(float)}).sort_values("Data")
+    df = get_sgs_serie(1, ano_inicio)
+    return df.rename(columns={"Valor": "USDBRL"})
 
 
 def get_commodity(ticker: str, nome: str, usd_brl: pd.DataFrame, ano_inicio: int) -> pd.DataFrame:
@@ -274,11 +304,16 @@ def formatar_planilha(caminho: str, n_linhas: int) -> None:
     cor_historico = PatternFill("solid", fgColor="E2EFDA")  # verde claro
     cor_projecao = PatternFill("solid", fgColor="FCE4D6")  # laranja claro
 
+    centralizado = Alignment(horizontal="center", vertical="center")
+
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = cor_header
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = centralizado
 
+    # Largura de cada coluna calculada a partir do texto que aparece na tela
+    # (já formatado - "1.234,56 R$", "04/07/2026" -, não do valor cru).
+    larguras: dict[int, int] = {}
     for row in range(2, n_linhas + 2):
         tipo = ws.cell(row, col["Tipo"]).value
         unidade = ws.cell(row, col["Unidade"]).value
@@ -286,13 +321,28 @@ def formatar_planilha(caminho: str, n_linhas: int) -> None:
         ws.cell(row, col["Tipo"]).fill = fill
 
         valor_cell = ws.cell(row, col["Valor"])
-        valor_cell.number_format = '#,##0.00" R$"' if "BRL" in str(unidade) else "0.00"
+        eh_brl = "BRL" in str(unidade)
+        valor_cell.number_format = '#,##0.00" R$"' if eh_brl else "0.00"
+        texto_valor = (f"{valor_cell.value:,.2f} R$" if eh_brl else f"{valor_cell.value:.2f}") if valor_cell.value is not None else ""
 
-        ws.cell(row, col["Data"]).number_format = "dd/mm/yyyy"
+        data_cell = ws.cell(row, col["Data"])
+        data_cell.number_format = "dd/mm/yyyy"
 
-    for col_cells in ws.columns:
-        largura = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
-        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(largura + 2, 45)
+        for nome_coluna, indice in col.items():
+            cell = ws.cell(row, indice)
+            cell.alignment = centralizado
+            if nome_coluna == "Valor":
+                texto = texto_valor
+            elif nome_coluna == "Data":
+                texto = data_cell.value.strftime("%d/%m/%Y") if data_cell.value else ""
+            else:
+                texto = str(cell.value) if cell.value is not None else ""
+            larguras[indice] = max(larguras.get(indice, 0), len(texto))
+
+    for nome_coluna, indice in col.items():
+        largura_cabecalho = len(str(nome_coluna))
+        largura = max(larguras.get(indice, 0), largura_cabecalho)
+        ws.column_dimensions[get_column_letter(indice)].width = largura + 4  # levemente maior que o conteúdo
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
