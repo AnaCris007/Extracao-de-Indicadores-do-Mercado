@@ -26,7 +26,9 @@ Fontes oficiais/gratuitas, sem chave de API:
 
 A planilha final fica em formato largo (`pivotar_tabela()`): 1 linha por
 indicador, 1 coluna por ano - ano mais antigo à esquerda, mais recente à
-direita.
+direita. O ano corrente (`ANO_TRIMESTRAL`) ganha 4 colunas extras
+(`adicionar_trimestres()`) - 1T/2T/3T/4T - pros indicadores com dado
+sub-anual disponível (IPCA, Ouro, Prata, USD/BRL).
 
 As funções de coleta (`get_*`), `montar_tabela()` e `pivotar_tabela()`
 também são reaproveitadas pelo app visual em `scripts/app.py`
@@ -52,6 +54,7 @@ from openpyxl.utils import get_column_letter
 HOJE = date.today()
 ANO_INICIO_PADRAO = HOJE.year - 7  # janela padrão de histórico
 ANO_FIM_PADRAO = HOJE.year + 4  # até onde a projeção Focus vai por padrão
+ANO_TRIMESTRAL = HOJE.year  # único ano que ganha colunas 1T/2T/3T/4T na planilha final
 OUTPUT = "data/premissas_valuation.xlsx"
 
 # Indicadores "macro" (1 linha/ano, Histórico até fechar + Projeção Focus
@@ -104,6 +107,35 @@ def get_ipca_historico() -> pd.DataFrame:
             "Valor": df["V"].astype(float),
             "Unidade": INDICADORES_MACRO["IPCA"],
             "AnoReferencia": df["D3C"].str[:4].astype(int),
+        }
+    ).reset_index(drop=True)
+
+
+def get_ipca_trimestral(ano: int) -> pd.DataFrame:
+    """IPCA acumulado por trimestre civil do `ano` pedido - IBGE/SIDRA.
+
+    Variável 2263 é "acumulado em 3 meses" (janela móvel, fecha todo mês);
+    pegando só os meses 03/06/09/12, essa janela coincide exatamente com
+    o trimestre civil (jan-fev-mar, abr-mai-jun, ...). Só quarters já
+    fechados vêm na resposta - a API do IBGE simplesmente omite os meses
+    ainda não publicados, sem "..." nem erro.
+    """
+    meses = [f"{ano}{m:02d}" for m in (3, 6, 9, 12)]
+    url = f"https://apisidra.ibge.gov.br/values/t/1737/n1/all/v/2263/p/{','.join(meses)}"
+    rows = requests.get(url, timeout=30).json()[1:]  # 1ª linha é cabeçalho
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["Data", "Indicador", "Tipo", "Valor", "Unidade", "Trimestre"])
+    df = df[df["V"] != "..."]
+    mes_para_trimestre = {"03": 1, "06": 2, "09": 3, "12": 4}
+    return pd.DataFrame(
+        {
+            "Data": pd.to_datetime(df["D3C"], format="%Y%m"),
+            "Indicador": "IPCA",
+            "Tipo": "Histórico",
+            "Valor": df["V"].astype(float),
+            "Unidade": "% (acumulado no trimestre)",
+            "Trimestre": df["D3C"].str[-2:].map(mes_para_trimestre),
         }
     ).reset_index(drop=True)
 
@@ -371,6 +403,54 @@ def pivotar_tabela(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[s
     return valores, tipos, unidades
 
 
+def adicionar_trimestres(valores: pd.DataFrame, tipos: pd.DataFrame, df: pd.DataFrame, ano: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Quebra a coluna do `ano` pedido em 4 colunas trimestrais
+    (1T-{ano} .. 4T-{ano}), inseridas antes da coluna anual - só pros
+    indicadores com granularidade sub-anual disponível:
+
+    - Ouro/Prata: último valor observado em cada trimestre (mesmo
+      critério do fechamento anual), a partir da série diária já
+      coletada em `df` (`montar_tabela`) - sem nenhuma chamada extra.
+    - USD/BRL: só há a cotação atual coletada (`get_usd_brl`); ela cai
+      no trimestre da sua própria data, os outros 3 ficam em branco -
+      não busca histórico só pra preencher a planilha.
+    - IPCA: 1 chamada extra ao IBGE (`get_ipca_trimestral`), só quando
+      `ano` está entre as colunas de `valores`.
+    - Selic/PIB: sem fonte de dado trimestral hoje - colunas em branco.
+
+    Se `ano` não estiver entre as colunas de `valores` (ex.: usuário
+    pediu um período que não inclui esse ano), devolve tudo sem
+    alteração.
+    """
+    if valores.empty or ano not in valores.columns:
+        return valores, tipos
+
+    colunas_tri = [f"{t}T-{ano}" for t in (1, 2, 3, 4)]
+    valores_tri = pd.DataFrame(index=valores.index, columns=colunas_tri, dtype=float)
+    tipos_tri = pd.DataFrame(index=valores.index, columns=colunas_tri, dtype=object)
+
+    diario = df[(df["AnoReferencia"] == ano) & df["Indicador"].isin(["Ouro", "Prata", INDICADOR_CAMBIO])]
+    if not diario.empty:
+        agrupado = diario.assign(Trimestre=diario["Data"].dt.quarter).sort_values("Data").groupby(["Indicador", "Trimestre"])
+        for (indicador, trimestre), valor in agrupado["Valor"].last().items():
+            if indicador in valores_tri.index:
+                col = f"{trimestre}T-{ano}"
+                valores_tri.loc[indicador, col] = valor
+                tipos_tri.loc[indicador, col] = agrupado["Tipo"].last()[(indicador, trimestre)]
+
+    if "IPCA" in valores.index:
+        for _, linha in get_ipca_trimestral(ano).iterrows():
+            col = f"{int(linha['Trimestre'])}T-{ano}"
+            valores_tri.loc["IPCA", col] = linha["Valor"]
+            tipos_tri.loc["IPCA", col] = linha["Tipo"]
+
+    posicao = list(valores.columns).index(ano)
+    ordem_colunas = list(valores.columns[:posicao]) + colunas_tri + list(valores.columns[posicao:])
+    valores = pd.concat([valores, valores_tri], axis=1)[ordem_colunas]
+    tipos = pd.concat([tipos, tipos_tri], axis=1)[ordem_colunas]
+    return valores, tipos
+
+
 def montar_tabela(indicadores: list[str], ano_inicio: int, ano_fim: int) -> pd.DataFrame:
     """Coleta só os indicadores/anos pedidos e devolve a tabela consolidada.
 
@@ -395,6 +475,7 @@ def montar_tabela(indicadores: list[str], ano_inicio: int, ano_fim: int) -> pd.D
         elif nome == INDICADOR_CAMBIO:
             tabelas.append(get_usd_brl())
 
+    tabelas = [t for t in tabelas if not t.empty]
     if not tabelas:
         return pd.DataFrame(columns=["Data", "Indicador", "Tipo", "Valor", "Unidade", "AnoReferencia"])
 
@@ -442,6 +523,7 @@ def formatar_planilha(caminho: str, valores: pd.DataFrame, tipos: pd.DataFrame, 
     ws = wb["Premissas"]
 
     cor_header = PatternFill("solid", fgColor="1F4E78")
+    cor_header_trimestre = PatternFill("solid", fgColor="000000")  # destaca colunas 1T/2T/3T/4T
     cor_historico = PatternFill("solid", fgColor="E2EFDA")  # verde claro
     cor_projecao = PatternFill("solid", fgColor="FCE4D6")  # laranja claro
     centralizado = Alignment(horizontal="center", vertical="center")
@@ -452,7 +534,8 @@ def formatar_planilha(caminho: str, valores: pd.DataFrame, tipos: pd.DataFrame, 
     for c in range(1, ultima_coluna + 1):
         cell = ws.cell(1, c)
         cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = cor_header
+        eh_trimestre = c >= COL_PRIMEIRO_ANO and isinstance(valores.columns[c - COL_PRIMEIRO_ANO], str)
+        cell.fill = cor_header_trimestre if eh_trimestre else cor_header
         cell.alignment = centralizado
 
     for r, indicador in enumerate(valores.index, start=2):
@@ -486,9 +569,10 @@ def formatar_planilha(caminho: str, valores: pd.DataFrame, tipos: pd.DataFrame, 
 def main() -> None:
     df = montar_tabela(TODOS_INDICADORES, ANO_INICIO_PADRAO, ANO_FIM_PADRAO)
     valores, tipos, unidades = pivotar_tabela(df)
+    valores, tipos = adicionar_trimestres(valores, tipos, df, ANO_TRIMESTRAL)
     montar_planilha(valores, unidades).to_excel(OUTPUT, sheet_name="Premissas", index_label="Indicador")
     formatar_planilha(OUTPUT, valores, tipos, unidades)
-    print(f"Salvo em {OUTPUT} - indicadores: {list(valores.index)} - anos: {list(valores.columns)}")
+    print(f"Salvo em {OUTPUT} - indicadores: {list(valores.index)} - colunas: {list(valores.columns)}")
 
 
 if __name__ == "__main__":

@@ -17,8 +17,10 @@ import streamlit as st
 from premissas_macro import (
     ANO_FIM_PADRAO,
     ANO_INICIO_PADRAO,
+    ANO_TRIMESTRAL,
     OUTPUT,
     TODOS_INDICADORES,
+    adicionar_trimestres,
     formatar_planilha,
     montar_planilha,
     montar_tabela,
@@ -47,6 +49,7 @@ if gerar:
         with st.spinner("Buscando dados nas APIs oficiais (IBGE, BCB, Yahoo Finance)..."):
             df = montar_tabela(indicadores, int(ano_inicio), int(ano_fim))
             valores, tipos, unidades = pivotar_tabela(df)
+            valores, tipos = adicionar_trimestres(valores, tipos, df, ANO_TRIMESTRAL)
             planilha = montar_planilha(valores, unidades)
             planilha.to_excel(OUTPUT, sheet_name="Premissas", index_label="Indicador")
             formatar_planilha(OUTPUT, valores, tipos, unidades)

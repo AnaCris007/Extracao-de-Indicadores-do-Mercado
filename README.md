@@ -100,5 +100,22 @@ Prata (diários) usam o último valor observado em cada ano — mesmo
 critério de "ano fechado" usado no histórico da Selic. USD/BRL só
 preenche a coluna do ano corrente, com a cotação do dia.
 
+### Colunas trimestrais do ano corrente
+
+A coluna do ano corrente (`ANO_TRIMESTRAL` em `premissas_macro.py`, hoje
+2026) vem quebrada em `1T-2026 | 2T-2026 | 3T-2026 | 4T-2026` antes da
+coluna anual, com destaque visual (cabeçalho preto) - só pros indicadores
+com dado sub-anual disponível:
+
+- **IPCA**: acumulado de cada trimestre civil (IBGE/SIDRA), preenchido só
+  pros trimestres já fechados.
+- **Ouro / Prata**: último valor observado em cada trimestre, a partir da
+  mesma série diária já coletada.
+- **USD/BRL**: como só a cotação atual é buscada (não o histórico), ela
+  cai no trimestre correspondente à data de hoje; os demais ficam em
+  branco.
+- **Selic / PIB**: sem quebra trimestral - as fontes atuais não têm
+  fechamento nem projeção por trimestre.
+
 Detalhes de cada fonte estão comentados no topo de
 [`scripts/premissas_macro.py`](scripts/premissas_macro.py).
