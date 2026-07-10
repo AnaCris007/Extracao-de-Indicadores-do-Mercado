@@ -17,12 +17,21 @@ Fontes oficiais/gratuitas, sem chave de API:
                                       fechado (curva de projeção, não o
                                       histórico de como a previsão mudou)
     - Ouro e Prata, histórico      -> Yahoo Finance (tickers GC=F e SI=F),
-                                      convertidos de USD para BRL pelo
-                                      câmbio PTAX oficial do Banco Central
+                                      cotação em USD/onça troy, como
+                                      negociado no mercado internacional
+    - USD/BRL                      -> Banco Central (SGS série 1, câmbio
+                                      PTAX venda), só a cotação mais atual
+                                      (1 linha, no ano corrente - não é
+                                      série histórica como Ouro/Prata)
 
-As funções de coleta (`get_*`) e `montar_tabela()` também são reaproveitadas
-pelo app visual em `scripts/app.py` (`streamlit run scripts/app.py`), que
-deixa escolher indicadores/período numa tela em vez de editar o código.
+A planilha final fica em formato largo (`pivotar_tabela()`): 1 linha por
+indicador, 1 coluna por ano - ano mais antigo à esquerda, mais recente à
+direita.
+
+As funções de coleta (`get_*`), `montar_tabela()` e `pivotar_tabela()`
+também são reaproveitadas pelo app visual em `scripts/app.py`
+(`streamlit run scripts/app.py`), que deixa escolher indicadores/período
+numa tela em vez de editar o código.
 
 pip install pandas requests yfinance openpyxl
 
@@ -30,6 +39,7 @@ Uso:
     python scripts/premissas_macro.py
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from urllib.parse import quote
 
@@ -54,9 +64,25 @@ INDICADORES_MACRO = {
 INDICADOR_FOCUS = {"IPCA": "IPCA", "Selic": "Selic", "PIB": "PIB Total"}
 
 # Commodities (histórico diário, sem projeção) e seu ticker na Yahoo Finance.
+# Cotadas nativamente em USD/onça troy - não convertidas para BRL.
 INDICADORES_COMMODITY = {"Ouro": "GC=F", "Prata": "SI=F"}
 
-TODOS_INDICADORES = list(INDICADORES_MACRO) + list(INDICADORES_COMMODITY)
+# Câmbio (histórico diário, sem projeção).
+INDICADOR_CAMBIO = "USD/BRL"
+
+TODOS_INDICADORES = list(INDICADORES_MACRO) + list(INDICADORES_COMMODITY) + [INDICADOR_CAMBIO]
+
+# De onde vem o valor de cada indicador - vira a coluna "Fonte" na planilha
+# final. Nos indicadores macro, histórico e projeção vêm de fontes
+# diferentes (IBGE/BCB vs. Focus), por isso os dois aparecem juntos.
+FONTES = {
+    "IPCA": "IBGE/SIDRA (histórico) + Focus/BCB (projeção)",
+    "Selic": "BCB SGS 432 (histórico) + Focus/BCB (projeção)",
+    "PIB": "IBGE/SIDRA (histórico) + Focus/BCB (projeção)",
+    "Ouro": "Yahoo Finance (GC=F)",
+    "Prata": "Yahoo Finance (SI=F)",
+    INDICADOR_CAMBIO: "BCB SGS 1 (PTAX)",
+}
 
 
 def get_ipca_historico() -> pd.DataFrame:
@@ -127,7 +153,7 @@ def get_sgs_serie(codigo: int, ano_inicio: int) -> pd.DataFrame:
         payload = None
         for tentativa in range(2):  # a API do BCB às vezes falha/demora de forma transitória
             try:
-                payload = requests.get(url, params=params, timeout=30).json()
+                payload = requests.get(url, params=params, timeout=15).json()
                 break
             except (requests.RequestException, ValueError):
                 if tentativa == 1:
@@ -138,7 +164,7 @@ def get_sgs_serie(codigo: int, ano_inicio: int) -> pd.DataFrame:
         inicio = fim_janela + timedelta(days=1)
 
     if not partes:
-        return pd.DataFrame(columns=["Data", "Valor"])
+        return pd.DataFrame({"Data": pd.Series(dtype="datetime64[ns]"), "Valor": pd.Series(dtype="float64")})
     df = pd.concat(partes, ignore_index=True)
     df["Data"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
     df["Valor"] = df["valor"].astype(float)
@@ -193,39 +219,91 @@ def get_focus(indicador: str, nome: str, unidade: str, anos: list[int]) -> pd.Da
     longo do tempo (isso existe, mas não serve pra alimentar um modelo de
     valuation: o que importa é o consenso de mercado *atual* para cada ano
     futuro).
+
+    Uma chamada HTTP por ano - feitas em paralelo (`ThreadPoolExecutor`)
+    pra não multiplicar o tempo de espera pelo número de anos. Timeout e
+    tentativas propositalmente curtos: se a API do BCB estiver
+    inacessível (rede/firewall bloqueando `bcb.gov.br`, não é raro em
+    rede corporativa/institucional), é melhor falhar rápido e seguir sem
+    a projeção daquele ano do que travar o app por minutos.
     """
-    linhas = []
-    for ano in anos:
+
+    def buscar_ano(ano: int) -> dict | None:
         filtro = f"Indicador eq '{indicador}' and DataReferencia eq '{ano}' and baseCalculo eq 0"
         params = {"$filter": filtro, "$orderby": "Data desc", "$top": "1", "$format": "json"}
         # A API do BCB só aceita espaço como %20 (não '+'), por isso o encode manual.
         query = "&".join(f"{k}={quote(v)}" for k, v in params.items())
         url = f"https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/ExpectativasMercadoAnuais?{query}"
-        payload = requests.get(url, timeout=30).json()["value"]
-        if not payload:  # nenhuma pesquisa registrada pra esse ano ainda
-            continue
+
+        payload = None
+        for tentativa in range(2):
+            try:
+                payload = requests.get(url, timeout=15).json()["value"]
+                break
+            except (requests.RequestException, ValueError):
+                if tentativa == 1:
+                    print(f"aviso: falha ao buscar projeção Focus de {indicador} para {ano}, pulando ano")
+
+        if not payload:  # nenhuma pesquisa registrada pra esse ano ainda, ou falha persistente
+            return None
         registro = payload[0]
-        linhas.append(
-            {
-                "Data": pd.to_datetime(registro["Data"]),
-                "Indicador": nome,
-                "Tipo": "Projeção",
-                "Valor": float(registro["Mediana"]),
-                "Unidade": unidade,
-                "AnoReferencia": ano,
-            }
-        )
+        return {
+            "Data": pd.to_datetime(registro["Data"]),
+            "Indicador": nome,
+            "Tipo": "Projeção",
+            "Valor": float(registro["Mediana"]),
+            "Unidade": unidade,
+            "AnoReferencia": ano,
+        }
+
+    if not anos:
+        return pd.DataFrame(columns=["Data", "Indicador", "Tipo", "Valor", "Unidade", "AnoReferencia"])
+
+    with ThreadPoolExecutor(max_workers=min(8, len(anos))) as executor:
+        resultados = executor.map(buscar_ano, anos)
+        linhas = [linha for linha in resultados if linha is not None]
     return pd.DataFrame(linhas)
 
 
-def get_usd_brl(ano_inicio: int) -> pd.DataFrame:
-    """Câmbio USD/BRL (PTAX venda) - Banco Central, série SGS 1."""
-    df = get_sgs_serie(1, ano_inicio)
-    return df.rename(columns={"Valor": "USDBRL"})
+def get_usd_brl() -> pd.DataFrame:
+    """Câmbio USD/BRL (PTAX venda) - só a cotação mais atual, Banco Central SGS série 1.
+
+    Diferente de Ouro/Prata (série histórica completa), aqui só interessa
+    o índice do dia - 1 única linha, no ano corrente. `/dados/ultimos/1` é
+    uma chamada rápida e leve, em vez de baixar anos de série diária só
+    pra usar o último valor.
+    """
+    url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados/ultimos/1"
+    payload = None
+    for tentativa in range(2):
+        try:
+            payload = requests.get(url, params={"formato": "json"}, timeout=15).json()
+            break
+        except (requests.RequestException, ValueError):
+            if tentativa == 1:
+                print("aviso: falha ao buscar cotação atual do USD/BRL")
+
+    if not payload:
+        return pd.DataFrame(columns=["Data", "Indicador", "Tipo", "Valor", "Unidade", "AnoReferencia"])
+
+    registro = payload[0]
+    data = pd.to_datetime(registro["data"], format="%d/%m/%Y")
+    return pd.DataFrame(
+        [
+            {
+                "Data": data,
+                "Indicador": INDICADOR_CAMBIO,
+                "Tipo": "Histórico",
+                "Valor": float(registro["valor"]),
+                "Unidade": "BRL",
+                "AnoReferencia": data.year,
+            }
+        ]
+    )
 
 
-def get_commodity(ticker: str, nome: str, usd_brl: pd.DataFrame, ano_inicio: int) -> pd.DataFrame:
-    """Cotação histórica de fechamento - Yahoo Finance, convertida para BRL.
+def get_commodity(ticker: str, nome: str, ano_inicio: int) -> pd.DataFrame:
+    """Cotação histórica de fechamento - Yahoo Finance, em USD/onça troy.
 
     Diferente de get_ipca/get_focus, aqui não há uma URL explícita: a
     biblioteca `yfinance` monta e chama a API do Yahoo Finance
@@ -234,24 +312,63 @@ def get_commodity(ticker: str, nome: str, usd_brl: pd.DataFrame, ano_inicio: int
     HTTP fica escondido dentro de `yf.Ticker(ticker).history(...)`.
 
     GC=F e SI=F (futuros de ouro/prata da COMEX) são cotados nativamente
-    em dólar por onça troy (1 onça troy = 31,1035 g). Aqui multiplicamos
-    pelo câmbio PTAX do próprio dia (ou do último dia útil disponível, via
-    merge_asof) pra converter para BRL/onça troy.
+    em dólar por onça troy (1 onça troy = 31,1035 g) - mantido em USD, como
+    negociado no mercado internacional, sem converter para BRL.
+
+    O Yahoo Finance às vezes falha de forma transitória e devolve uma
+    tabela vazia (sem levantar exceção) - `hist.index` nesse caso não é
+    um `DatetimeIndex`, então tenta de novo antes de desistir e pular o
+    indicador, em vez de deixar o resto da coleta quebrar por causa disso.
     """
     hist = yf.Ticker(ticker).history(start=date(ano_inicio, 1, 1), interval="1d")
+    if hist.empty:
+        hist = yf.Ticker(ticker).history(start=date(ano_inicio, 1, 1), interval="1d")
+
+    if hist.empty:
+        print(f"aviso: Yahoo Finance não retornou cotação para {nome} ({ticker}), pulando indicador")
+        return pd.DataFrame(columns=["Data", "Indicador", "Tipo", "Valor", "Unidade", "AnoReferencia"])
+
     dates = hist.index.tz_localize(None).astype("datetime64[ns]")
-    df = pd.DataFrame({"Data": dates, "ValorUSD": hist["Close"]}).sort_values("Data")
-    df = pd.merge_asof(df, usd_brl.astype({"Data": "datetime64[ns]"}), on="Data", direction="backward")
     return pd.DataFrame(
         {
-            "Data": df["Data"],
+            "Data": dates,
             "Indicador": nome,
             "Tipo": "Histórico",
-            "Valor": (df["ValorUSD"] * df["USDBRL"]).round(2),
-            "Unidade": "BRL/onça troy",
-            "AnoReferencia": df["Data"].dt.year,
+            "Valor": hist["Close"].round(2).to_numpy(),
+            "Unidade": "USD/onça troy",
+            "AnoReferencia": dates.year,
         }
-    )
+    ).sort_values("Data").reset_index(drop=True)
+
+
+def pivotar_tabela(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    """Reformata a tabela longa (1 linha por Data/Indicador) em formato
+    largo: 1 linha por indicador, 1 coluna por ano - ano mais antigo à
+    esquerda, mais recente à direita.
+
+    Indicadores anuais (IPCA/Selic/PIB) já têm só um valor por ano.
+    Indicadores diários (Ouro, Prata, USD/BRL) usam o último valor
+    observado em cada ano - mesmo critério de "ano fechado" já usado no
+    histórico da Selic (`get_selic_historico`).
+
+    Devolve `(valores, tipos, unidades)`: `valores` e `tipos` no mesmo
+    formato largo (índice = Indicador, colunas = Ano), usados pra escrever
+    a planilha e colorir Histórico/Projeção; `unidades` mapeia indicador
+    -> unidade, usado pra formatar cada linha (%, USD, R$).
+    """
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    agrupado = df.sort_values("Data").groupby(["Indicador", "AnoReferencia"])
+    valores = agrupado["Valor"].last().unstack("AnoReferencia")
+    tipos = agrupado["Tipo"].last().unstack("AnoReferencia")
+
+    ordem = [nome for nome in TODOS_INDICADORES if nome in valores.index]
+    anos = sorted(valores.columns)
+    valores = valores.reindex(index=ordem, columns=anos)
+    tipos = tipos.reindex(index=ordem, columns=anos)
+    unidades = df.drop_duplicates("Indicador").set_index("Indicador")["Unidade"].to_dict()
+    return valores, tipos, unidades
 
 
 def montar_tabela(indicadores: list[str], ano_inicio: int, ano_fim: int) -> pd.DataFrame:
@@ -262,7 +379,6 @@ def montar_tabela(indicadores: list[str], ano_inicio: int, ano_fim: int) -> pd.D
     só com o que o usuário selecionou na tela).
     """
     tabelas: list[pd.DataFrame] = []
-    usd_brl = None
 
     for nome in indicadores:
         if nome in INDICADORES_MACRO:
@@ -275,9 +391,9 @@ def montar_tabela(indicadores: list[str], ano_inicio: int, ano_fim: int) -> pd.D
             projecao = get_focus(INDICADOR_FOCUS[nome], nome, INDICADORES_MACRO[nome], anos)
             tabelas += [historico, projecao]
         elif nome in INDICADORES_COMMODITY:
-            if usd_brl is None:
-                usd_brl = get_usd_brl(ano_inicio)
-            tabelas.append(get_commodity(INDICADORES_COMMODITY[nome], nome, usd_brl, ano_inicio))
+            tabelas.append(get_commodity(INDICADORES_COMMODITY[nome], nome, ano_inicio))
+        elif nome == INDICADOR_CAMBIO:
+            tabelas.append(get_usd_brl())
 
     if not tabelas:
         return pd.DataFrame(columns=["Data", "Indicador", "Tipo", "Valor", "Unidade", "AnoReferencia"])
@@ -287,73 +403,92 @@ def montar_tabela(indicadores: list[str], ano_inicio: int, ano_fim: int) -> pd.D
     return df.sort_values(["Indicador", "Data"]).reset_index(drop=True)
 
 
-def formatar_planilha(caminho: str, n_linhas: int) -> None:
-    """Aplica formatação visual ao .xlsx já salvo: cabeçalho, cores por Tipo,
-    largura de coluna e formato numérico por unidade (%, R$).
+def formato_numero(unidade: str) -> str:
+    """Formato numérico do Excel apropriado pra unidade do indicador."""
+    if "%" in unidade:
+        return '0.00"%"'
+    if unidade == "BRL":  # câmbio USD/BRL
+        return '#,##0.0000" R$"'
+    return '#,##0.00" USD"'  # commodities (USD/onça troy)
 
-    Reaberto depois do `df.to_excel` de propósito - separa "gerar o dado"
-    de "deixar bonito", em vez de misturar estilo com a lógica de coleta.
+
+def montar_planilha(valores: pd.DataFrame, unidades: dict[str, str]) -> pd.DataFrame:
+    """DataFrame pronto pra `to_excel`: colunas `Unidade` e `Fonte`
+    inseridas logo depois do índice (Indicador), antes das colunas de ano."""
+    saida = valores.copy()
+    saida.insert(0, "Fonte", [FONTES.get(indicador, "") for indicador in saida.index])
+    saida.insert(0, "Unidade", [unidades.get(indicador, "") for indicador in saida.index])
+    return saida
+
+
+# Layout fixo da planilha final: A = Indicador (índice), B = Unidade,
+# C = Fonte, D em diante = anos.
+COL_UNIDADE = 2
+COL_FONTE = 3
+COL_PRIMEIRO_ANO = 4
+
+
+def formatar_planilha(caminho: str, valores: pd.DataFrame, tipos: pd.DataFrame, unidades: dict[str, str]) -> None:
+    """Aplica formatação visual ao .xlsx já salvo: cabeçalho, uma linha por
+    indicador com cor por Tipo (Histórico/Projeção) e formato numérico por
+    linha (%, USD, R$), largura de coluna.
+
+    Reaberto depois do `to_excel` de propósito - separa "gerar o dado" de
+    "deixar bonito", em vez de misturar estilo com a lógica de coleta.
     """
     from openpyxl import load_workbook
 
     wb = load_workbook(caminho)
     ws = wb["Premissas"]
 
-    col = {cell.value: cell.column for cell in ws[1]}  # nome da coluna -> índice
     cor_header = PatternFill("solid", fgColor="1F4E78")
     cor_historico = PatternFill("solid", fgColor="E2EFDA")  # verde claro
     cor_projecao = PatternFill("solid", fgColor="FCE4D6")  # laranja claro
-
     centralizado = Alignment(horizontal="center", vertical="center")
 
-    for cell in ws[1]:
+    n_indicadores, n_anos = valores.shape
+    ultima_coluna = COL_PRIMEIRO_ANO + n_anos - 1
+
+    for c in range(1, ultima_coluna + 1):
+        cell = ws.cell(1, c)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = cor_header
         cell.alignment = centralizado
 
-    # Largura de cada coluna calculada a partir do texto que aparece na tela
-    # (já formatado - "1.234,56 R$", "04/07/2026" -, não do valor cru).
-    larguras: dict[int, int] = {}
-    for row in range(2, n_linhas + 2):
-        tipo = ws.cell(row, col["Tipo"]).value
-        unidade = ws.cell(row, col["Unidade"]).value
-        fill = cor_historico if tipo == "Histórico" else cor_projecao
-        ws.cell(row, col["Tipo"]).fill = fill
+    for r, indicador in enumerate(valores.index, start=2):
+        label = ws.cell(r, 1)
+        label.font = Font(bold=True)
+        label.alignment = Alignment(horizontal="left", vertical="center")
 
-        valor_cell = ws.cell(row, col["Valor"])
-        eh_brl = "BRL" in str(unidade)
-        valor_cell.number_format = '#,##0.00" R$"' if eh_brl else "0.00"
-        texto_valor = (f"{valor_cell.value:,.2f} R$" if eh_brl else f"{valor_cell.value:.2f}") if valor_cell.value is not None else ""
+        ws.cell(r, COL_UNIDADE).alignment = centralizado
+        ws.cell(r, COL_FONTE).alignment = Alignment(horizontal="left", vertical="center")
 
-        data_cell = ws.cell(row, col["Data"])
-        data_cell.number_format = "dd/mm/yyyy"
-
-        for nome_coluna, indice in col.items():
-            cell = ws.cell(row, indice)
+        formato = formato_numero(unidades.get(indicador, ""))
+        for c, ano in enumerate(valores.columns, start=COL_PRIMEIRO_ANO):
+            valor = valores.loc[indicador, ano]
+            if pd.isna(valor):
+                continue
+            cell = ws.cell(r, c)
             cell.alignment = centralizado
-            if nome_coluna == "Valor":
-                texto = texto_valor
-            elif nome_coluna == "Data":
-                texto = data_cell.value.strftime("%d/%m/%Y") if data_cell.value else ""
-            else:
-                texto = str(cell.value) if cell.value is not None else ""
-            larguras[indice] = max(larguras.get(indice, 0), len(texto))
+            cell.number_format = formato
+            cell.fill = cor_historico if tipos.loc[indicador, ano] == "Histórico" else cor_projecao
 
-    for nome_coluna, indice in col.items():
-        largura_cabecalho = len(str(nome_coluna))
-        largura = max(larguras.get(indice, 0), largura_cabecalho)
-        ws.column_dimensions[get_column_letter(indice)].width = largura + 4  # levemente maior que o conteúdo
+    ws.column_dimensions["A"].width = max((len(str(i)) for i in valores.index), default=8) + 4
+    ws.column_dimensions[get_column_letter(COL_UNIDADE)].width = max((len(str(u)) for u in unidades.values()), default=8) + 4
+    ws.column_dimensions[get_column_letter(COL_FONTE)].width = max((len(str(f)) for f in FONTES.values()), default=8) + 4
+    for c in range(COL_PRIMEIRO_ANO, ultima_coluna + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 14
 
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = ws.cell(2, COL_PRIMEIRO_ANO).coordinate
     wb.save(caminho)
 
 
 def main() -> None:
     df = montar_tabela(TODOS_INDICADORES, ANO_INICIO_PADRAO, ANO_FIM_PADRAO)
-    df.to_excel(OUTPUT, index=False, sheet_name="Premissas")
-    formatar_planilha(OUTPUT, len(df))
-    print(f"Salvo em {OUTPUT} - {len(df)} linhas - indicadores: {sorted(df['Indicador'].unique())}")
+    valores, tipos, unidades = pivotar_tabela(df)
+    montar_planilha(valores, unidades).to_excel(OUTPUT, sheet_name="Premissas", index_label="Indicador")
+    formatar_planilha(OUTPUT, valores, tipos, unidades)
+    print(f"Salvo em {OUTPUT} - indicadores: {list(valores.index)} - anos: {list(valores.columns)}")
 
 
 if __name__ == "__main__":

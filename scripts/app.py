@@ -20,12 +20,14 @@ from premissas_macro import (
     OUTPUT,
     TODOS_INDICADORES,
     formatar_planilha,
+    montar_planilha,
     montar_tabela,
+    pivotar_tabela,
 )
 
 st.set_page_config(page_title="Premissas Macro", page_icon="📊", layout="wide")
 st.title("Premissas Macro para Valuation")
-st.caption("IPCA, Selic, PIB, Ouro e Prata — fontes oficiais: IBGE, Banco Central e Yahoo Finance")
+st.caption("IPCA, Selic, PIB, Ouro, Prata e USD/BRL — fontes oficiais: IBGE, Banco Central e Yahoo Finance")
 
 with st.form("filtros"):
     indicadores = st.multiselect("Indicadores", TODOS_INDICADORES, default=TODOS_INDICADORES)
@@ -44,13 +46,15 @@ if gerar:
     else:
         with st.spinner("Buscando dados nas APIs oficiais (IBGE, BCB, Yahoo Finance)..."):
             df = montar_tabela(indicadores, int(ano_inicio), int(ano_fim))
-            df.to_excel(OUTPUT, index=False, sheet_name="Premissas")
-            formatar_planilha(OUTPUT, len(df))
+            valores, tipos, unidades = pivotar_tabela(df)
+            planilha = montar_planilha(valores, unidades)
+            planilha.to_excel(OUTPUT, sheet_name="Premissas", index_label="Indicador")
+            formatar_planilha(OUTPUT, valores, tipos, unidades)
 
-        if df.empty:
+        if valores.empty:
             st.error("Nenhum dado retornado para essa combinação de indicadores/período.")
         else:
-            st.success(f"{len(df)} linhas geradas para {len(indicadores)} indicador(es).")
+            st.success(f"{len(valores)} indicador(es) gerados para {len(valores.columns)} ano(s).")
             with open(OUTPUT, "rb") as f:
                 st.download_button(
                     "⬇️ Baixar Excel",
@@ -58,4 +62,4 @@ if gerar:
                     file_name="premissas_valuation.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            st.dataframe(df, use_container_width=True, height=420)
+            st.dataframe(planilha, width="stretch")
